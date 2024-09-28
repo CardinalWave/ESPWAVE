@@ -354,13 +354,13 @@ void loop() {
   {
     unsigned int s = WiFi.status();
     if (s == 0 && millis() > (lastConnectTry + 60000)) {
-      /* If WLAN disconnected and idle try to connect */
-      /* Don't set retry time too low as retry interfere the softAP operation */
       connect = true;
     }
     if (status != s) {  // WLAN status change
       Serial.print("Status: ");
       Serial.println(s);
+      digitalWrite(LED_BUILTIN, HIGH);
+      delay(5000);
       status = s;
       if (s == WL_CONNECTED) {
         /* Just connected to WLAN */
