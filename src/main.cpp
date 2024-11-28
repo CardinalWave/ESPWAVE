@@ -8,15 +8,13 @@
 #include <ESP8266HTTPClient.h>
 #include <PubSubClient.h>
 #include <WebSocketsServer.h>
-
 #include <Preferences.h>
-
 #include <ArduinoJson.h>
 #include <map>
 #include <string>
 
 #ifndef APSSID
-#define APSSID "CardinalCloudAP"
+#define APSSID "CardinalCloudAP_ESP8266"
 #define APPSK "password"
 #endif
 
@@ -53,7 +51,7 @@ DNSServer dnsServer;
 ESP8266WebServer server(80);
 
 // WebSocket
-WebSocketsServer webSocket = WebSocketsServer(5000);
+WebSocketsServer webSocket = WebSocketsServer(5004);
 
 /* Soft AP network parameters */
 IPAddress apIP(172, 217, 28, 1);
@@ -72,6 +70,8 @@ unsigned int status = WL_IDLE_STATUS;
 // Preferences ( ESP - MemoryManagent)
 Preferences preferences;
 
+String payloadReturn = "";
+
 // Client WebSocket
 struct WebSocketMQTTSessao {
   uint8_t webSocketClientID;
@@ -83,6 +83,7 @@ enum TopicType {
   FULL_TOPIC,
   SESSION_TOPIC
 };
+
 
 WebSocketMQTTSessao sessions[10]; // Supondo um máximo de 10 sessões simultâneas ///////// FAZER O CW-BFF-SERVICE MANDAR A SESSAO E DISPOSITIVO QUANDO CONECTADO NO SOCKET
 int sessionCount = 0;
@@ -119,6 +120,7 @@ uint8_t getWebSocketId(const char* mqttTopic) {
     if (sessions[i].mqttTopic == mqttTopic) {
       Serial.println(sessions[i].mqttTopic);
       return sessions[i].webSocketClientID;
+      
       break;
     }
   }
@@ -129,6 +131,7 @@ char* formatTopic(const char* sessionId, const char* action, const char *device)
   size_t totalLength = strlen(device) + strlen(sessionId) + strlen(action) + 5;
   char* format = new char[totalLength];
   snprintf(format, totalLength, "/%s/%s/%s", device, sessionId, action);
+  Serial.printf("/n FormatTopic/%s/%s/%s", device, sessionId, action);
   return format;
 }
 
@@ -147,27 +150,53 @@ char* extractSessionTopic(const char* fullTopic) {
   }
 }
 
-// JSON
-const char **deserializationJson(const char* payload){
-  // Use arduinojson.org/assistant to compute the capacity.
-  StaticJsonDocument<200> doc;
+char** deserializationJson(const char* payload) {
+    StaticJsonDocument<200> doc;
 
-  // Deserialize o JSON
-  DeserializationError error = deserializeJson(doc, payload);
-  if (error) {
-      Serial.print("Falha ao deserializar JSON: ");
-      Serial.println(error.c_str());
-      return {};
-  }
-  const char* sessionId = doc["session_id"]; 
-  const char* action = doc["action"];
+    // Deserialize o JSON
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+        Serial.print("Falha ao deserializar JSON: ");
+        Serial.println(error.c_str());
+        return nullptr; // Retornar nullptr em caso de erro
+    }
+    const char* sessionId = doc["session_id"];
+    const char* action = doc["action"];
 
-  char* send = formatTopic(sessionId, action, TOPIC);
-  char* receive = formatTopic(sessionId, action, TOPIC_SERVER);
+    // Alocar memória para o array de tópicos
+    char** topics = (char**)malloc(2 * sizeof(char*));
+    if (!topics) {
+        Serial.println("Falha ao alocar memória para tópicos");
+        return nullptr; // Retornar nullptr se a alocação falhar
+    }
+    // Preencher os tópicos
+    topics[0] = formatTopic(sessionId, action, TOPIC);
+    topics[1] = formatTopic(sessionId, action, TOPIC_SERVER);
 
-  static const char *topic[] = {send, receive}; 
-  return topic;
+    if (!topics[0] || !topics[1]) {
+        Serial.println("Falha ao alocar memória para send ou receive");
+        free(topics[0]);
+        free(topics[1]);
+        free(topics);
+        return nullptr; // Retornar nullptr se a alocação falhar
+    }
+
+    Serial.printf("send = %s\n", topics[0]);
+    Serial.printf("receive = %s\n", topics[1]);
+
+    return topics; // Retornar o array de tópicos
 }
+
+
+void freeTopics(char** topics) {
+    if (topics) {
+        free(topics[0]); // Liberar send
+        free(topics[1]); // Liberar receive
+        free(topics);    // Liberar o array de tópicos
+    }
+}
+
+
 /** Is this an IP? */
 boolean isIp(String str) {
   for (size_t i = 0; i < str.length(); i++) {
@@ -227,11 +256,12 @@ void callback(char* topic, byte* payload, unsigned int length)
     messageWebSocket(payloadStr, topic);
 }
 
-void messageOverMqtt(const char **topics, const char *payload) {
+void messageOverMqtt(char **topics, const char *payload) {
     mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD );
     mqttClient.subscribe(topics[1]);
     mqttClient.publish(topics[0], payload);
     Serial.printf("Send message on %s", topics[0]);
+    Serial.printf(payload);
     Serial.println();
 }
 
@@ -249,20 +279,20 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
       }
       break;
     case WStype_TEXT:
-      const char **topics = deserializationJson((char*)payload);
-      messageOverMqtt(topics, (char*)payload);
+      char **topics = deserializationJson((char*)payload);
+      messageOverMqtt(topics, (char*) payload);
       addSession(num, extractSessionTopic(topics[0]));
+      freeTopics(topics);
       break;
   }
 }
 
 /** Redirect to captive portal if we got a request for another domain. Return true in that case so the page handler do not try to handle the request again. */
 boolean captivePortal() {
-  Serial.println(server.hostHeader());
   if (!isIp(server.hostHeader()) && server.hostHeader() != (String(myHostname) + ".net")) {
     Serial.println("Request redirected to captive portal");
     server.sendHeader("Location", String("http://") + (String(myHostname) + ".net"), true);
-    server.send(302, "text/plain", "");  // Empty content inhibits Content-length header so we have to close the socket ourselves.
+    server.send(200, "text/plain", payloadReturn);  // Empty content inhibits Content-length header so we have to close the socket ourselves.
     server.client().stop();              // Stop is needed because we sent no content length
     return true;
   }
@@ -277,8 +307,8 @@ void handleRoot() {
   while (http.GET() <= 0) {
     http.begin(client, "http://cardinalwave.net"); 
   }
-  String payload = http.getString();
-  server.send(200, "text/html", payload);
+  payloadReturn = http.getString();
+  server.send(200, "text/html", http.getString());
 }
 
 void handleNotFound() {
@@ -303,7 +333,7 @@ void handleNotFound() {
 
 void setup() {
   delay(1000);
-  Serial.begin(9600);
+  Serial.begin(115200);
   Serial.println();
   Serial.println("Configuring access point...");
   /* You can remove the password parameter if you want the AP to be open. */
@@ -324,9 +354,6 @@ void setup() {
   server.on("/", handleRoot);
   server.onNotFound(handleNotFound); 
   server.begin();  // Web server start
-
-  preferences.begin("cw-page", false); 
-  preferences.clear();
 
   // JSON
 
@@ -384,7 +411,6 @@ void loop() {
               mqttClient.setCallback(callback);
               mqttClient.publish("/esp8266/device/connect", "ping");
               mqttClient.subscribe("/server/#");
-              mqttClient.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASSWORD );
           } else {
               delay(500);
               Serial.print(".");
